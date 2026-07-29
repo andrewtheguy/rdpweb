@@ -68,6 +68,7 @@ pub enum VideoCodec {
     Avc420 = 1,
     RgbaClearCodec = 2,
     RgbaProgressive = 3,
+    RgbaSurfaceCommand = 4,
 }
 
 impl VideoPacket {

@@ -83,7 +83,7 @@ function parsePacket(buffer) {
   const dataLength = view.getUint32(34, true);
   if (
     HEADER_LENGTH + dataLength !== buffer.byteLength ||
-    ![1, 2, 3].includes(bytes[5])
+    ![1, 2, 3, 4].includes(bytes[5])
   ) {
     return null;
   }
@@ -121,12 +121,12 @@ function drawRgba(packet) {
   frameCount += 1;
   if (firstFrameAt === 0) firstFrameAt = performance.now();
   emptyState.classList.add("hidden");
-  setStatus(
-    packet.codec === 2
-      ? "Live · ClearCodec fallback"
-      : "Live · Progressive fallback",
-    true,
-  );
+  const source = {
+    2: "ClearCodec fallback",
+    3: "Progressive fallback",
+    4: "EGFX surface operations",
+  }[packet.codec];
+  setStatus(`Live · ${source}`, true);
   updateStats();
 }
 
