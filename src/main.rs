@@ -86,6 +86,7 @@ async fn ws_session(socket: WebSocket, target: Arc<Target>) {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut rdp_done = spawn_rdp(target, input_rx, event_tx);
+    let mut event_channel_open = true;
 
     loop {
         tokio::select! {
@@ -95,13 +96,21 @@ async fn ws_session(socket: WebSocket, target: Arc<Target>) {
                         match serde_json::from_str::<ClientMsg>(&text) {
                             Ok(input) => {
                                 if input_tx.send(input).is_err() {
+                                    warn!("RDP input channel closed");
                                     break;
                                 }
                             }
                             Err(error) => warn!("ignoring invalid browser input: {error}"),
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(frame))) => {
+                        info!("browser WebSocket closed: {frame:?}");
+                        break;
+                    }
+                    None => {
+                        info!("browser WebSocket stream ended");
+                        break;
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         warn!("browser WebSocket read failed: {error}");
@@ -109,9 +118,10 @@ async fn ws_session(socket: WebSocket, target: Arc<Target>) {
                     }
                 }
             }
-            event = event_rx.recv() => {
+            event = event_rx.recv(), if event_channel_open => {
                 let Some(event) = event else {
-                    break;
+                    event_channel_open = false;
+                    continue;
                 };
                 let message = match event {
                     GatewayEvent::Control(control) => {
@@ -125,7 +135,8 @@ async fn ws_session(socket: WebSocket, target: Arc<Target>) {
                     }
                     GatewayEvent::Video(packet) => Message::Binary(packet.encode().into()),
                 };
-                if ws_tx.send(message).await.is_err() {
+                if let Err(error) = ws_tx.send(message).await {
+                    warn!("browser WebSocket write failed: {error}");
                     break;
                 }
             }

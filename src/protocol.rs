@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const VIDEO_MAGIC: &[u8; 4] = b"RDPH";
 pub const VIDEO_VERSION: u8 = 1;
-pub const VIDEO_HEADER_LEN: usize = 42;
+pub const VIDEO_HEADER_LEN: usize = 38;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -52,7 +52,6 @@ pub struct VideoPacket {
     pub codec: VideoCodec,
     pub key_frame: bool,
     pub timestamp_us: u64,
-    pub frame_id: u32,
     pub surface_id: u16,
     pub x: u16,
     pub y: u16,
@@ -67,6 +66,8 @@ pub struct VideoPacket {
 #[repr(u8)]
 pub enum VideoCodec {
     Avc420 = 1,
+    RgbaClearCodec = 2,
+    RgbaProgressive = 3,
 }
 
 impl VideoPacket {
@@ -79,7 +80,6 @@ impl VideoPacket {
         bytes.push(u8::from(self.key_frame));
         bytes.push(0);
         bytes.extend_from_slice(&self.timestamp_us.to_le_bytes());
-        bytes.extend_from_slice(&self.frame_id.to_le_bytes());
         bytes.extend_from_slice(&self.surface_id.to_le_bytes());
         bytes.extend_from_slice(&self.x.to_le_bytes());
         bytes.extend_from_slice(&self.y.to_le_bytes());
@@ -103,7 +103,6 @@ mod tests {
             codec: VideoCodec::Avc420,
             key_frame: true,
             timestamp_us: 99,
-            frame_id: 7,
             surface_id: 2,
             x: 3,
             y: 4,

@@ -3,7 +3,10 @@ use std::time::Instant;
 
 use ironrdp::core::{Decode as _, ReadCursor, impl_as_any};
 use ironrdp::dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+use ironrdp::graphics::clearcodec::ClearCodecDecoder;
+use ironrdp::graphics::progressive::ProgressiveDecoder;
 use ironrdp::graphics::zgfx;
+use ironrdp::pdu::geometry::Rectangle as _;
 use ironrdp::pdu::{PduResult, decode_cursor, decode_err};
 use ironrdp_egfx::CHANNEL_NAME;
 use ironrdp_egfx::pdu::{
@@ -17,17 +20,35 @@ use crate::protocol::{ControlMsg, GatewayEvent, VideoCodec, VideoPacket};
 
 const MAX_RETAINED_DECOMPRESSED_CAPACITY: usize = 8 * 1024 * 1024;
 
+#[derive(Clone, Copy, Default)]
+struct SurfaceInfo {
+    width: u16,
+    height: u16,
+    output_x: u32,
+    output_y: u32,
+}
+
+#[derive(Clone, Copy)]
+struct BitmapRegion {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
 pub struct EgfxPassthrough {
     tx: mpsc::UnboundedSender<GatewayEvent>,
     decompressor: zgfx::Decompressor,
+    clearcodec: ClearCodecDecoder,
+    progressive: ProgressiveDecoder,
     decompressed: Vec<u8>,
-    surface_origins: BTreeMap<u16, (u32, u32)>,
-    current_frame_id: u32,
+    surfaces: BTreeMap<u16, SurfaceInfo>,
     queued_frames: u32,
     total_frames: u32,
     clock: Instant,
     last_timestamp_us: u64,
-    warned_progressive: bool,
+    warned_clearcodec_error: bool,
+    warned_progressive_error: bool,
     warned_unsupported_codec: bool,
 }
 
@@ -36,20 +57,53 @@ impl EgfxPassthrough {
         Self {
             tx,
             decompressor: zgfx::Decompressor::new(),
+            clearcodec: ClearCodecDecoder::new(),
+            progressive: ProgressiveDecoder::new(),
             decompressed: Vec::new(),
-            surface_origins: BTreeMap::new(),
-            current_frame_id: 0,
+            surfaces: BTreeMap::new(),
             queued_frames: 0,
             total_frames: 0,
             clock: Instant::now(),
             last_timestamp_us: 0,
-            warned_progressive: false,
+            warned_clearcodec_error: false,
+            warned_progressive_error: false,
             warned_unsupported_codec: false,
         }
     }
 
     fn control(&self, message: ControlMsg) {
         let _ = self.tx.send(GatewayEvent::Control(message));
+    }
+
+    fn next_timestamp_us(&mut self) -> u64 {
+        let elapsed = u64::try_from(self.clock.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let timestamp_us = elapsed.max(self.last_timestamp_us.saturating_add(1));
+        self.last_timestamp_us = timestamp_us;
+        timestamp_us
+    }
+
+    fn send_bitmap(
+        &mut self,
+        codec: VideoCodec,
+        surface_id: u16,
+        region: BitmapRegion,
+        data: Vec<u8>,
+    ) {
+        let surface = self.surfaces.get(&surface_id).copied().unwrap_or_default();
+        let packet = VideoPacket {
+            codec,
+            key_frame: false,
+            timestamp_us: self.next_timestamp_us(),
+            surface_id,
+            x: region.x,
+            y: region.y,
+            width: region.width,
+            height: region.height,
+            output_x: surface.output_x,
+            output_y: surface.output_y,
+            data,
+        };
+        let _ = self.tx.send(GatewayEvent::Video(packet));
     }
 
     fn handle_pdu(&mut self, pdu: GfxPdu) -> PduResult<Vec<DvcMessage>> {
@@ -65,32 +119,82 @@ impl EgfxPassthrough {
                 Ok(Vec::new())
             }
             GfxPdu::ResetGraphics(reset) => {
-                self.surface_origins.clear();
+                self.surfaces.clear();
+                self.clearcodec = ClearCodecDecoder::new();
+                self.progressive.reset();
+                self.warned_clearcodec_error = false;
+                self.warned_progressive_error = false;
                 self.control(ControlMsg::Resize {
                     width: reset.width,
                     height: reset.height,
                 });
                 Ok(Vec::new())
             }
-            GfxPdu::MapSurfaceToOutput(mapping) => {
-                self.surface_origins.insert(
-                    mapping.surface_id,
-                    (mapping.output_origin_x, mapping.output_origin_y),
+            GfxPdu::CreateSurface(surface) => {
+                self.surfaces.insert(
+                    surface.surface_id,
+                    SurfaceInfo {
+                        width: surface.width,
+                        height: surface.height,
+                        ..SurfaceInfo::default()
+                    },
                 );
                 Ok(Vec::new())
             }
-            GfxPdu::StartFrame(start) => {
-                self.current_frame_id = start.frame_id;
+            GfxPdu::DeleteSurface(surface) => {
+                self.surfaces.remove(&surface.surface_id);
+                Ok(Vec::new())
+            }
+            GfxPdu::MapSurfaceToOutput(mapping) => {
+                let surface = self.surfaces.entry(mapping.surface_id).or_default();
+                surface.output_x = mapping.output_origin_x;
+                surface.output_y = mapping.output_origin_y;
+                Ok(Vec::new())
+            }
+            GfxPdu::StartFrame(_) => {
                 self.queued_frames = self.queued_frames.saturating_add(1);
                 Ok(Vec::new())
             }
             GfxPdu::WireToSurface1(wire) => {
+                if wire.codec_id == Codec1Type::ClearCodec {
+                    let width = wire.destination_rectangle.width();
+                    let height = wire.destination_rectangle.height();
+                    let mut pixels = match self
+                        .clearcodec
+                        .decode(&wire.bitmap_data, width, height)
+                    {
+                        Ok(pixels) => pixels,
+                        Err(error) => {
+                            if !self.warned_clearcodec_error {
+                                self.warned_clearcodec_error = true;
+                                warn!(
+                                    "could not decode ClearCodec update; continuing with later EGFX updates: {error}"
+                                );
+                            }
+                            return Ok(Vec::new());
+                        }
+                    };
+                    bgra_to_rgba(&mut pixels);
+                    self.send_bitmap(
+                        VideoCodec::RgbaClearCodec,
+                        wire.surface_id,
+                        BitmapRegion {
+                            x: wire.destination_rectangle.left,
+                            y: wire.destination_rectangle.top,
+                            width,
+                            height,
+                        },
+                        pixels,
+                    );
+                    return Ok(Vec::new());
+                }
+
                 if wire.codec_id != Codec1Type::Avc420 {
                     if !self.warned_unsupported_codec {
                         self.warned_unsupported_codec = true;
                         self.control(ControlMsg::Warning {
                             message: format!(
-                                "server sent {:?}; this POC deliberately negotiates AVC420 only",
+                                "server sent unsupported EGFX codec {:?}",
                                 wire.codec_id
                             ),
                         });
@@ -104,45 +208,80 @@ impl EgfxPassthrough {
                 let rectangle = wire.destination_rectangle;
                 let width = rectangle.right.saturating_sub(rectangle.left);
                 let height = rectangle.bottom.saturating_sub(rectangle.top);
-                let (output_x, output_y) = self
-                    .surface_origins
+                let surface = self
+                    .surfaces
                     .get(&wire.surface_id)
                     .copied()
                     .unwrap_or_default();
 
-                let elapsed = u64::try_from(self.clock.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let timestamp_us = elapsed.max(self.last_timestamp_us.saturating_add(1));
-                self.last_timestamp_us = timestamp_us;
-
                 let packet = VideoPacket {
                     codec: VideoCodec::Avc420,
                     key_frame: contains_idr(stream.data),
-                    timestamp_us,
-                    frame_id: self.current_frame_id,
+                    timestamp_us: self.next_timestamp_us(),
                     surface_id: wire.surface_id,
                     x: rectangle.left,
                     y: rectangle.top,
                     width,
                     height,
-                    output_x,
-                    output_y,
+                    output_x: surface.output_x,
+                    output_y: surface.output_y,
                     data: stream.data.to_vec(),
                 };
                 let _ = self.tx.send(GatewayEvent::Video(packet));
                 Ok(Vec::new())
             }
-            GfxPdu::WireToSurface2(_) => {
-                if !self.warned_progressive {
-                    self.warned_progressive = true;
-                    self.control(ControlMsg::Warning {
-                        message: "server selected RemoteFX Progressive instead of AVC420"
-                            .to_owned(),
-                    });
+            GfxPdu::WireToSurface2(wire) => {
+                let Some(surface) = self.surfaces.get(&wire.surface_id).copied() else {
+                    warn!(
+                        "progressive update references unknown surface {}",
+                        wire.surface_id
+                    );
+                    return Ok(Vec::new());
+                };
+                let tiles = match self
+                    .progressive
+                    .decode_bitmap(
+                        wire.codec_context_id,
+                        surface.width,
+                        surface.height,
+                        &wire.bitmap_data,
+                    )
+                {
+                    Ok(tiles) => tiles,
+                    Err(error) => {
+                        if !self.warned_progressive_error {
+                            self.warned_progressive_error = true;
+                            warn!("could not decode RemoteFX Progressive update: {error}");
+                        }
+                        return Ok(Vec::new());
+                    }
+                };
+
+                for tile in tiles {
+                    let x = tile.x_idx.saturating_mul(64);
+                    let y = tile.y_idx.saturating_mul(64);
+                    let width = surface.width.saturating_sub(x).min(64);
+                    let height = surface.height.saturating_sub(y).min(64);
+                    let pixels = crop_rgba_tile(&tile.pixels, width, height);
+                    self.send_bitmap(
+                        VideoCodec::RgbaProgressive,
+                        wire.surface_id,
+                        BitmapRegion {
+                            x,
+                            y,
+                            width,
+                            height,
+                        },
+                        pixels,
+                    );
                 }
                 Ok(Vec::new())
             }
+            GfxPdu::DeleteEncodingContext(context) => {
+                self.progressive.delete_context(context.codec_context_id);
+                Ok(Vec::new())
+            }
             GfxPdu::EndFrame(end) => {
-                self.current_frame_id = 0;
                 self.queued_frames = self.queued_frames.saturating_sub(1);
                 self.total_frames = self.total_frames.wrapping_add(1);
                 let acknowledge = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
@@ -213,6 +352,26 @@ impl DvcProcessor for EgfxPassthrough {
 
 impl DvcClientProcessor for EgfxPassthrough {}
 
+fn bgra_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
+fn crop_rgba_tile(pixels: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let width = usize::from(width);
+    let height = usize::from(height);
+    if width == 64 && height == 64 {
+        return pixels.to_vec();
+    }
+
+    let mut cropped = Vec::with_capacity(width.saturating_mul(height).saturating_mul(4));
+    for row in pixels.chunks_exact(64 * 4).take(height) {
+        cropped.extend_from_slice(&row[..width * 4]);
+    }
+    cropped
+}
+
 fn contains_idr(data: &[u8]) -> bool {
     let mut offset = 0usize;
     while offset.saturating_add(4) <= data.len() {
@@ -251,5 +410,19 @@ mod tests {
     fn rejects_truncated_avc_access_unit() {
         let data = [0, 0, 0, 8, 0x65];
         assert!(!contains_idr(&data));
+    }
+
+    #[test]
+    fn converts_bgra_pixels_to_rgba() {
+        let mut pixels = [1, 2, 3, 255, 4, 5, 6, 255];
+        bgra_to_rgba(&mut pixels);
+        assert_eq!(pixels, [3, 2, 1, 255, 6, 5, 4, 255]);
+    }
+
+    #[test]
+    fn crops_edge_progressive_tile() {
+        let pixels = vec![7; 64 * 64 * 4];
+        let cropped = crop_rgba_tile(&pixels, 3, 2);
+        assert_eq!(cropped, vec![7; 3 * 2 * 4]);
     }
 }

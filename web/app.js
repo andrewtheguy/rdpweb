@@ -1,4 +1,4 @@
-const HEADER_LENGTH = 42;
+const HEADER_LENGTH = 38;
 const MAGIC = [0x52, 0x44, 0x50, 0x48];
 
 const canvas = document.querySelector("#desktop");
@@ -46,7 +46,11 @@ function onMessage(event) {
     return;
   }
   byteCount += packet.data.byteLength;
-  decoderFor(packet.surfaceId).push(packet);
+  if (packet.codec === 1) {
+    decoderFor(packet.surfaceId).push(packet);
+  } else {
+    drawRgba(packet);
+  }
 }
 
 function onControl(message) {
@@ -76,28 +80,58 @@ function parsePacket(buffer) {
     return null;
   }
   const view = new DataView(buffer);
-  const dataLength = view.getUint32(38, true);
-  if (HEADER_LENGTH + dataLength !== buffer.byteLength || bytes[5] !== 1) {
+  const dataLength = view.getUint32(34, true);
+  if (
+    HEADER_LENGTH + dataLength !== buffer.byteLength ||
+    ![1, 2, 3].includes(bytes[5])
+  ) {
     return null;
   }
   return {
+    codec: bytes[5],
     keyFrame: (bytes[6] & 1) !== 0,
     timestamp: Number(view.getBigUint64(8, true)),
-    frameId: view.getUint32(16, true),
-    surfaceId: view.getUint16(20, true),
-    x: view.getUint16(22, true),
-    y: view.getUint16(24, true),
-    width: view.getUint16(26, true),
-    height: view.getUint16(28, true),
-    outputX: view.getUint32(30, true),
-    outputY: view.getUint32(34, true),
+    surfaceId: view.getUint16(16, true),
+    x: view.getUint16(18, true),
+    y: view.getUint16(20, true),
+    width: view.getUint16(22, true),
+    height: view.getUint16(24, true),
+    outputX: view.getUint32(26, true),
+    outputY: view.getUint32(30, true),
     data: new Uint8Array(buffer, HEADER_LENGTH, dataLength),
   };
 }
 
+function drawRgba(packet) {
+  if (packet.data.byteLength !== packet.width * packet.height * 4) {
+    showError("Bridge sent an invalid RGBA tile.");
+    return;
+  }
+  const pixels = new Uint8ClampedArray(
+    packet.data.buffer,
+    packet.data.byteOffset,
+    packet.data.byteLength,
+  );
+  context.putImageData(
+    new ImageData(pixels, packet.width, packet.height),
+    packet.outputX + packet.x,
+    packet.outputY + packet.y,
+  );
+
+  frameCount += 1;
+  if (firstFrameAt === 0) firstFrameAt = performance.now();
+  emptyState.classList.add("hidden");
+  setStatus(
+    packet.codec === 2
+      ? "Live · ClearCodec fallback"
+      : "Live · Progressive fallback",
+    true,
+  );
+  updateStats();
+}
+
 class SurfaceDecoder {
-  constructor(surfaceId) {
-    this.surfaceId = surfaceId;
+  constructor() {
     this.pending = [];
     this.metadata = new Map();
     this.configuring = false;
@@ -216,7 +250,7 @@ class SurfaceDecoder {
 function decoderFor(surfaceId) {
   let decoder = decoders.get(surfaceId);
   if (!decoder) {
-    decoder = new SurfaceDecoder(surfaceId);
+    decoder = new SurfaceDecoder();
     decoders.set(surfaceId, decoder);
   }
   return decoder;

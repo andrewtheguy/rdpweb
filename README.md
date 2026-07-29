@@ -16,6 +16,16 @@ This project is the only bridge between the RDP server and browser. It:
 The browser builds an `AVCDecoderConfigurationRecord` from the in-band SPS/PPS,
 so the H.264 bytes remain in their original AVC format end to end.
 
+Windows may use mandatory ClearCodec or RemoteFX Progressive for static desktop
+content even after confirming AVC420. Those codecs are decoded by IronRDP and
+sent as raw RGBA tiles, without a WebP/PNG/JPEG re-encode. AVC420 remains the
+zero-copy compressed path whenever the host selects it.
+
+The published `ironrdp-connector` 0.10.0 does not advertise the GCC
+`SUPPORT_DYN_VC_GFX_PROTOCOL` flag required for a Windows server to open the
+graphics dynamic channel. This project sets that flag on the connector's
+generated Client MCS Connect Initial PDU before it is written to the server.
+
 ## Run
 
 Use a remotex-compatible config:
@@ -83,10 +93,10 @@ should report `Live · AVC420 passthrough`.
 
 ## POC boundary
 
-- AVC420 only. AVC444 is two dependent H.264 views and needs two decoders plus
-  the MS-RDPEGFX chroma reconstruction step.
-- No fallback renderer. A host that selects Progressive RemoteFX produces a
-  visible warning instead of silently returning to WebP.
+- AVC420 is the only H.264 mode. AVC444 is two dependent H.264 views and needs
+  two decoders plus the MS-RDPEGFX chroma reconstruction step.
+- ClearCodec and RemoteFX Progressive use a raw-RGBA fallback. This avoids an
+  image re-encode but uses more bridge-to-browser bandwidth than AVC420.
 - No audio, clipboard, resize/reactivation, remote cursor shapes, auth, or
   multi-client session management.
 - The server binds loopback by default because target credentials remain in the

@@ -1,23 +1,33 @@
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use ironrdp::core::decode;
 use ironrdp::connector::{
     ClientConnector, Config, ConnectionResult, Credentials, DesktopSize, ServerName,
 };
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
+use ironrdp::pdu::gcc::{ClientEarlyCapabilityFlags, ConferenceCreateRequest};
 use ironrdp::pdu::gcc::KeyboardType;
 use ironrdp::pdu::input::MousePdu;
 use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp::pdu::input::mouse::PointerFlags;
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
+use ironrdp::pdu::x224::{X224, X224Data};
+use ironrdp::pdu::mcs;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
-use ironrdp_tokio::{FramedWrite as _, TokioFramed};
+use ironrdp_tokio::bytes::BytesMut;
+use ironrdp_tokio::{
+    Framed, FramedRead, FramedWrite, StreamWrapper, TokioFramed,
+};
 use log::{debug, info};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
 
 use crate::config::Target;
@@ -27,7 +37,105 @@ use crate::protocol::{ClientMsg, ControlMsg, GatewayEvent, MouseButton};
 
 trait AsyncReadWrite: AsyncRead + AsyncWrite {}
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite {}
-type UpgradedFramed = TokioFramed<Box<dyn AsyncReadWrite + Unpin + Send + Sync>>;
+type ErasedStream = Box<dyn AsyncReadWrite + Unpin + Send + Sync>;
+type UpgradedFramed = Framed<GfxFlagStream<ErasedStream>>;
+
+struct GfxFlagStream<S> {
+    inner: S,
+    flag_sent: bool,
+}
+
+impl<S> StreamWrapper for GfxFlagStream<S> {
+    type InnerStream = S;
+
+    fn from_inner(inner: Self::InnerStream) -> Self {
+        Self {
+            inner,
+            flag_sent: false,
+        }
+    }
+
+    fn into_inner(self) -> Self::InnerStream {
+        self.inner
+    }
+
+    fn get_inner(&self) -> &Self::InnerStream {
+        &self.inner
+    }
+
+    fn get_inner_mut(&mut self) -> &mut Self::InnerStream {
+        &mut self.inner
+    }
+}
+
+impl<S> FramedRead for GfxFlagStream<S>
+where
+    S: Send + Sync + Unpin + AsyncRead,
+{
+    type ReadFut<'read>
+        = Pin<Box<dyn Future<Output = io::Result<usize>> + Send + Sync + 'read>>
+    where
+        Self: 'read;
+
+    fn read<'a>(&'a mut self, buf: &'a mut BytesMut) -> Self::ReadFut<'a> {
+        Box::pin(async { self.inner.read_buf(buf).await })
+    }
+}
+
+impl<S> FramedWrite for GfxFlagStream<S>
+where
+    S: Send + Sync + Unpin + AsyncWrite,
+{
+    type WriteAllFut<'write>
+        = Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'write>>
+    where
+        Self: 'write;
+
+    fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+        Box::pin(async move {
+            let patched = if self.flag_sent {
+                None
+            } else {
+                match add_gfx_capability_flag(buf) {
+                    Ok(Some(packet)) => {
+                        self.flag_sent = true;
+                        Some(packet)
+                    }
+                    Ok(None) => None,
+                    Err(error) => return Err(io::Error::other(error)),
+                }
+            };
+            self.inner.write_all(patched.as_deref().unwrap_or(buf)).await?;
+            self.inner.flush().await
+        })
+    }
+}
+
+fn add_gfx_capability_flag(packet: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+    let Ok(X224(x224_data)) = decode::<X224<X224Data<'_>>>(packet) else {
+        return Ok(None);
+    };
+    let Ok(mut connect_initial) = decode::<mcs::ConnectInitial>(x224_data.data.as_ref()) else {
+        return Ok(None);
+    };
+
+    let mut gcc_blocks = connect_initial
+        .conference_create_request
+        .into_gcc_blocks();
+    let flags = gcc_blocks
+        .core
+        .optional_data
+        .early_capability_flags
+        .get_or_insert(ClientEarlyCapabilityFlags::empty());
+    flags.insert(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL);
+    connect_initial.conference_create_request =
+        ConferenceCreateRequest::new(gcc_blocks).context("rebuild GCC conference request")?;
+
+    let mut patched = ironrdp::core::WriteBuf::new();
+    let written = ironrdp::connector::encode_x224_packet(&connect_initial, &mut patched)
+        .context("encode EGFX-capable MCS Connect Initial")?;
+    Ok(Some(patched.filled()[..written].to_vec()))
+}
 
 pub async fn run(
     target: Arc<Target>,
@@ -173,8 +281,8 @@ async fn connect(
         .await
         .context("RDP TLS upgrade")?;
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
-    let erased: Box<dyn AsyncReadWrite + Unpin + Send + Sync> = Box::new(tls_stream);
-    let mut framed = TokioFramed::new_with_leftover(erased, leftover);
+    let erased: ErasedStream = Box::new(tls_stream);
+    let mut framed: UpgradedFramed = Framed::new_with_leftover(erased, leftover);
     let server_public_key = ironrdp_tls::extract_tls_server_public_key(&tls_certificate)
         .context("extract RDP TLS public key")?
         .to_owned();
@@ -338,5 +446,52 @@ mod tests {
         assert_eq!(clamp_u16(-1), 0);
         assert_eq!(clamp_u16(42), 42);
         assert_eq!(clamp_u16(100_000), u16::MAX);
+    }
+
+    #[test]
+    fn adds_dynamic_graphics_pipeline_capability_to_connector_packet() {
+        let config = build_connector_config(&Target {
+            protocol: Some("rdp".to_owned()),
+            name: None,
+            host: "desktop".to_owned(),
+            port: 3389,
+            username: "user".to_owned(),
+            password: "secret".to_owned(),
+            width: 1280,
+            height: 800,
+        });
+        let mut connector = ClientConnector::new(
+            config,
+            "127.0.0.1:49152".parse().expect("client address"),
+        );
+        connector.state = ironrdp::connector::ClientConnectorState::BasicSettingsExchangeSendInitial {
+            selected_protocol: ironrdp::pdu::nego::SecurityProtocol::HYBRID_EX,
+        };
+        let mut packet = ironrdp::core::WriteBuf::new();
+        let written = ironrdp::connector::Sequence::step_no_input(
+            &mut connector,
+            &mut packet,
+        )
+        .expect("build connector packet")
+        .size()
+        .expect("connector wrote a packet");
+
+        let patched = add_gfx_capability_flag(&packet.filled()[..written])
+            .expect("patch connector packet")
+            .expect("packet is MCS Connect Initial");
+        let X224(x224_data) =
+            decode::<X224<X224Data<'_>>>(&patched).expect("decode patched X.224 packet");
+        let connect_initial = decode::<mcs::ConnectInitial>(x224_data.data.as_ref())
+            .expect("decode patched MCS Connect Initial");
+        assert!(
+            connect_initial
+                .conference_create_request
+                .gcc_blocks()
+                .core
+                .optional_data
+                .early_capability_flags
+                .expect("early capability flags")
+                .contains(ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL)
+        );
     }
 }
