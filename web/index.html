@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rdpweb · AVC420 passthrough</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <p class="eyebrow">MS-RDPEGFX → WebCodecs</p>
+        <h1>rdpweb</h1>
+      </div>
+      <div class="readout">
+        <span id="state-dot" class="dot"></span>
+        <span id="status">Opening bridge…</span>
+        <span id="stats">0 frames · 0 MB</span>
+      </div>
+    </header>
+    <main>
+      <div id="stage">
+        <canvas id="desktop" width="1280" height="800" tabindex="0" aria-label="Remote desktop"></canvas>
+        <div id="empty-state">
+          <div class="pulse"></div>
+          <p>Negotiating RDP graphics</p>
+          <small>The host must accept EGFX AVC420.</small>
+        </div>
+      </div>
+    </main>
+    <footer>
+      <span>AVC420 proof of concept</span>
+      <span>Click the desktop to capture keyboard input</span>
+    </footer>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

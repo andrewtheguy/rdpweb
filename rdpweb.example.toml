@@ -1,0 +1,9 @@
+[[targets]]
+protocol = "rdp"
+name = "desktop"
+host = "192.0.2.10"
+port = 3389
+username = "user"
+password = "change-me"
+width = 1280
+height = 800
